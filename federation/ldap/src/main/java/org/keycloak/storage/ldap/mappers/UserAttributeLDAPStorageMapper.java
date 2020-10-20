@@ -60,6 +60,8 @@ public class UserAttributeLDAPStorageMapper extends AbstractLDAPStorageMapper {
     public static final String IS_MANDATORY_IN_LDAP = "is.mandatory.in.ldap";
     public static final String IS_BINARY_ATTRIBUTE = "is.binary.attribute";
 
+    public static final String EMAIL_VERIFIED = "emailVerified";
+
     public UserAttributeLDAPStorageMapper(ComponentModel mapperModel, LDAPStorageProvider ldapProvider) {
         super(mapperModel, ldapProvider);
     }
@@ -246,6 +248,12 @@ public class UserAttributeLDAPStorageMapper extends AbstractLDAPStorageMapper {
                     super.setFirstName(firstName);
                 }
 
+                @Override
+                public void setEmailVerified(boolean verified) {
+                    setLDAPAttribute(/*UserModel.*/EMAIL_VERIFIED, Boolean.toString(verified));
+                    super.setEmailVerified(verified);
+                }
+
                 protected boolean setLDAPAttribute(String modelAttrName, Object value) {
                     if (modelAttrName.equalsIgnoreCase(userModelAttrName)) {
                         if (UserAttributeLDAPStorageMapper.logger.isTraceEnabled()) {
@@ -373,6 +381,15 @@ public class UserAttributeLDAPStorageMapper extends AbstractLDAPStorageMapper {
                         return ldapUser.getAttributeAsString(ldapAttrName);
                     } else {
                         return super.getEmail();
+                    }
+                }
+
+                @Override
+                public boolean isEmailVerified() {
+                    if (/*UserModel.*/EMAIL_VERIFIED.equalsIgnoreCase(userModelAttrName)) {
+                        return Boolean.parseBoolean(ldapUser.getAttributeAsString(ldapAttrName));
+                    } else {
+                        return super.isEmailVerified();
                     }
                 }
 

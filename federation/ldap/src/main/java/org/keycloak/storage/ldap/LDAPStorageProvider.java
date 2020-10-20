@@ -185,9 +185,12 @@ public class LDAPStorageProvider implements UserStorageProvider,
             case UNSYNCED:
                 // Any attempt to write data, which are not supported by the LDAP schema, should fail
                 // This check is skipped when register new user as there are many "generic" attributes always written (EG. enabled, emailVerified) and those are usually unsupported by LDAP schema
-                if (!model.isImportEnabled() && !newUser) {
-                    UserModel readOnlyDelegate = new ReadOnlyUserModelDelegate(local, ModelException::new);
-                    proxied = new LDAPWritesOnlyUserModelDelegate(readOnlyDelegate, this);
+                // if (!model.isImportEnabled() && !newUser) {
+                //     UserModel readOnlyDelegate = new ReadOnlyUserModelDelegate(local, ModelException::new);
+                //     proxied = new LDAPWritesOnlyUserModelDelegate(readOnlyDelegate, this);
+                // }
+                if (!newUser) {
+                    proxied = new LDAPWritesOnlyUserModelDelegate(local, this, realm);
                 }
                 break;
         }
@@ -311,6 +314,26 @@ public class LDAPStorageProvider implements UserStorageProvider,
 
         ldapIdentityStore.remove(ldapObject);
         userManager.removeManagedUserEntry(user.getId());
+
+        return true;
+    }
+
+    public boolean updateAttribute (RealmModel realm, UserModel user, String attributeName, String attributeValue ) {
+        if (editMode == UserStorageProvider.EditMode.READ_ONLY || editMode == UserStorageProvider.EditMode.UNSYNCED) {
+            logger.warnf("User '%s' can't update attribute %s in LDAP as editMode is '%s'.", 
+                user.getUsername(), attributeName, editMode.toString());
+            return true;
+        }
+
+        LDAPObject ldapObject = loadAndValidateUser(realm, user);
+        if (ldapObject == null) {
+            logger.warnf("User '%s' update attribute %s in LDAP as it doesn't exist here", 
+                user.getUsername(), attributeName);
+            return false;
+        }
+
+        ldapObject.setSingleAttribute(attributeName, attributeValue);
+        ldapIdentityStore.update(ldapObject);
 
         return true;
     }
