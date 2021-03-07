@@ -16,5 +16,6 @@ docker run --rm -it \
   -e KEYCLOAK_PASSWORD=admin \
   -e KEYCLOAK_LOGLEVEL=DEBUG \
   -v ${cwd}/../federation/ldap/target/keycloak-ldap-federation-${VERSION}.jar:/opt/jboss/keycloak/modules/system/layers/keycloak/org/keycloak/keycloak-ldap-federation/main/keycloak-ldap-federation-${VERSION}.jar \
+  -v ${cwd}/../services/target/keycloak-services-${VERSION}.jar:/opt/jboss/keycloak/modules/system/layers/keycloak/org/keycloak/keycloak-services/main/keycloak-services-${VERSION}.jar \
   -v ${cwd}/../deployments:/opt/jboss/keycloak/standalone/deployments \
   jboss/keycloak:$VERSION
