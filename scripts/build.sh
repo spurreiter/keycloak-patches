@@ -12,12 +12,8 @@ lwd="$cwd/.."
 
 echo $VERSION
 
-cd "$lwd"
-
 mvnbuild(){
-  cd "$lwd/federation/ldap"
-  mvn clean install
-  cd "$lwd/services"
+  cd "$lwd"
   mvn clean install
 }
 
@@ -36,7 +32,7 @@ copy(){
 }
 
 dockerbuild(){
-  cd $lwd
+  cd "$lwd"
   (cat << EOS
 FROM jboss/keycloak:$VERSION
 
