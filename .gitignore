@@ -2,3 +2,4 @@
 /keycloak-*
 target/
 Dockerfile
+tmp/
