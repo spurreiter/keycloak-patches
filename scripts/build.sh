@@ -17,6 +17,8 @@ cd "$lwd"
 mvnbuild(){
   cd "$lwd/federation/ldap"
   mvn clean install
+  cd "$lwd/services"
+  mvn clean install
 }
 
 copy(){
@@ -29,6 +31,8 @@ copy(){
 
   cp "$lwd/federation/ldap/target/keycloak-ldap-federation-${VERSION}.jar" \
     "$deployments"
+  cp "$lwd/services/target/keycloak-services-${VERSION}.jar" \
+    "$deployments"
 }
 
 dockerbuild(){
@@ -37,6 +41,7 @@ dockerbuild(){
 FROM jboss/keycloak:$VERSION
 
 COPY ./federation/ldap/target/keycloak-ldap-federation-${VERSION}.jar /opt/jboss/keycloak/modules/system/layers/keycloak/org/keycloak/keycloak-ldap-federation/main/keycloak-ldap-federation-${VERSION}.jar
+COPY ./services/target/keycloak-services-${VERSION}.jar /opt/jboss/keycloak/modules/system/layers/keycloak/org/keycloak/keycloak-services/main/keycloak-services-${VERSION}.jar
 
 ENTRYPOINT []
 
