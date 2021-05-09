@@ -16,6 +16,10 @@
  */
 package org.keycloak.protocol.oidc;
 
+import static org.keycloak.protocol.oidc.grants.device.DeviceGrantType.approveOAuth2DeviceAuthorization;
+import static org.keycloak.protocol.oidc.grants.device.DeviceGrantType.denyOAuth2DeviceAuthorization;
+import static org.keycloak.protocol.oidc.grants.device.DeviceGrantType.isOAuth2DeviceVerificationFlow;
+
 import org.jboss.logging.Logger;
 import org.keycloak.OAuth2Constants;
 import org.keycloak.OAuthErrorException;
@@ -36,6 +40,7 @@ import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserSessionModel;
 import org.keycloak.protocol.LoginProtocol;
+import org.keycloak.protocol.oidc.grants.device.DeviceGrantType;
 import org.keycloak.protocol.oidc.utils.OIDCRedirectUriBuilder;
 import org.keycloak.protocol.oidc.utils.OIDCResponseMode;
 import org.keycloak.protocol.oidc.utils.OIDCResponseType;
@@ -83,6 +88,7 @@ public class OIDCLoginProtocol implements LoginProtocol {
     public static final String UI_LOCALES_PARAM = OAuth2Constants.UI_LOCALES_PARAM;
     public static final String CLAIMS_PARAM = "claims";
     public static final String ACR_PARAM = "acr_values";
+    public static final String ID_TOKEN_HINT = "id_token_hint";
 
     public static final String LOGOUT_REDIRECT_URI = "OIDC_LOGOUT_REDIRECT_URI";
     public static final String ISSUER = "iss";
@@ -184,7 +190,11 @@ public class OIDCLoginProtocol implements LoginProtocol {
 
     @Override
     public Response authenticated(AuthenticationSessionModel authSession, UserSessionModel userSession, ClientSessionContext clientSessionCtx) {
-        AuthenticatedClientSessionModel clientSession= clientSessionCtx.getClientSession();
+        AuthenticatedClientSessionModel clientSession = clientSessionCtx.getClientSession();
+
+        if (isOAuth2DeviceVerificationFlow(authSession)) {
+            return approveOAuth2DeviceAuthorization(authSession, clientSession, session);
+        }
 
         String responseTypeParam = authSession.getClientNote(OIDCLoginProtocol.RESPONSE_TYPE_PARAM);
         String responseModeParam = authSession.getClientNote(OIDCLoginProtocol.RESPONSE_MODE_PARAM);
@@ -257,19 +267,20 @@ public class OIDCLoginProtocol implements LoginProtocol {
 
             if (responseType.hasResponseType(OIDCResponseType.TOKEN)) {
                 redirectUri.addParam(OAuth2Constants.ACCESS_TOKEN, res.getToken());
-                if (responseType.isImplicitFlow()) {
-                    redirectUri.addParam("token_type", res.getTokenType());
-                    redirectUri.addParam("expires_in", String.valueOf(res.getExpiresIn()));
-                }
+                redirectUri.addParam(OAuth2Constants.TOKEN_TYPE, res.getTokenType());
+                redirectUri.addParam(OAuth2Constants.EXPIRES_IN, String.valueOf(res.getExpiresIn()));
             }
         }
 
         return redirectUri.build();
     }
 
-
     @Override
     public Response sendError(AuthenticationSessionModel authSession, Error error) {
+        if (isOAuth2DeviceVerificationFlow(authSession)) {
+            return denyOAuth2DeviceAuthorization(authSession, error, session);
+        }
+
         String responseTypeParam = authSession.getClientNote(OIDCLoginProtocol.RESPONSE_TYPE_PARAM);
         String responseModeParam = authSession.getClientNote(OIDCLoginProtocol.RESPONSE_MODE_PARAM);
         setupResponseTypeAndMode(responseTypeParam, responseModeParam);
@@ -277,7 +288,7 @@ public class OIDCLoginProtocol implements LoginProtocol {
         String redirect = authSession.getRedirectUri();
         String state = authSession.getClientNote(OIDCLoginProtocol.STATE_PARAM);
         OIDCRedirectUriBuilder redirectUri = OIDCRedirectUriBuilder.fromUri(redirect, responseMode);
-        
+
         if (error != Error.CANCELLED_AIA_SILENT) {
             redirectUri.addParam(OAuth2Constants.ERROR, translateError(error));
         }

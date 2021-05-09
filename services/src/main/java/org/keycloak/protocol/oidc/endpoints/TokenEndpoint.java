@@ -62,10 +62,13 @@ import org.keycloak.models.UserSessionModel;
 import org.keycloak.models.utils.AuthenticationFlowResolver;
 import org.keycloak.protocol.LoginProtocol;
 import org.keycloak.protocol.LoginProtocolFactory;
+import org.keycloak.protocol.oidc.grants.ciba.CibaGrantType;
+import org.keycloak.protocol.oidc.grants.device.DeviceGrantType;
 import org.keycloak.protocol.oidc.OIDCAdvancedConfigWrapper;
 import org.keycloak.protocol.oidc.OIDCLoginProtocol;
 import org.keycloak.protocol.oidc.TokenManager;
 import org.keycloak.protocol.oidc.utils.AuthorizeClientUtil;
+import org.keycloak.protocol.oidc.utils.PkceUtils;
 import org.keycloak.protocol.saml.JaxrsSAML2BindingBuilder;
 import org.keycloak.protocol.saml.SamlClient;
 import org.keycloak.protocol.saml.SamlProtocol;
@@ -84,8 +87,8 @@ import org.keycloak.services.CorsErrorResponseException;
 import org.keycloak.services.ServicesLogger;
 import org.keycloak.services.Urls;
 import org.keycloak.services.clientpolicy.ClientPolicyException;
-import org.keycloak.services.clientpolicy.TokenRefreshContext;
-import org.keycloak.services.clientpolicy.TokenRequestContext;
+import org.keycloak.services.clientpolicy.context.TokenRefreshContext;
+import org.keycloak.services.clientpolicy.context.TokenRequestContext;
 import org.keycloak.services.managers.AppAuthManager;
 import org.keycloak.services.managers.AuthenticationManager;
 import org.keycloak.services.managers.AuthenticationSessionManager;
@@ -121,7 +124,6 @@ import javax.ws.rs.core.Response;
 import javax.ws.rs.core.Response.Status;
 import javax.xml.namespace.QName;
 import java.io.IOException;
-import java.security.MessageDigest;
 
 import java.util.List;
 import java.util.Map;
@@ -134,6 +136,7 @@ import java.util.regex.Pattern;
 import java.util.stream.Stream;
 import java.util.stream.Collectors;
 
+import static org.keycloak.authentication.authenticators.util.AuthenticatorUtils.getDisabledByBruteForceEventError;
 import static org.keycloak.models.ImpersonationSessionNote.IMPERSONATOR_ID;
 import static org.keycloak.models.ImpersonationSessionNote.IMPERSONATOR_USERNAME;
 
@@ -148,7 +151,7 @@ public class TokenEndpoint {
     private Map<String, String> clientAuthAttributes;
 
     private enum Action {
-        AUTHORIZATION_CODE, REFRESH_TOKEN, PASSWORD, CLIENT_CREDENTIALS, TOKEN_EXCHANGE, PERMISSION
+        AUTHORIZATION_CODE, REFRESH_TOKEN, PASSWORD, CLIENT_CREDENTIALS, TOKEN_EXCHANGE, PERMISSION, OAUTH2_DEVICE_CODE, CIBA
     }
 
     // https://tools.ietf.org/html/rfc7636#section-4.2
@@ -212,6 +215,7 @@ public class TokenEndpoint {
 
         if (!action.equals(Action.PERMISSION)) {
             checkClient();
+            checkParameterDuplicated();
         }
 
         switch (action) {
@@ -227,6 +231,10 @@ public class TokenEndpoint {
                 return tokenExchange();
             case PERMISSION:
                 return permissionGrant();
+            case OAUTH2_DEVICE_CODE:
+                return oauth2DeviceCodeToToken();
+            case CIBA:
+                return cibaGrant();
         }
 
         throw new RuntimeException("Unknown action " + action);
@@ -262,7 +270,7 @@ public class TokenEndpoint {
     }
 
     private void checkClient() {
-        AuthorizeClientUtil.ClientAuthResult clientAuth = AuthorizeClientUtil.authorizeClient(session, event);
+        AuthorizeClientUtil.ClientAuthResult clientAuth = AuthorizeClientUtil.authorizeClient(session, event, cors);
         client = clientAuth.getClient();
         clientAuthAttributes = clientAuth.getClientAuthAttributes();
 
@@ -298,12 +306,27 @@ public class TokenEndpoint {
         } else if (grantType.equals(OAuth2Constants.UMA_GRANT_TYPE)) {
             event.event(EventType.PERMISSION_TOKEN);
             action = Action.PERMISSION;
+        } else if (grantType.equals(OAuth2Constants.DEVICE_CODE_GRANT_TYPE)) {
+            event.event(EventType.OAUTH2_DEVICE_CODE_TO_TOKEN);
+            action = Action.OAUTH2_DEVICE_CODE;
+        } else if (grantType.equals(OAuth2Constants.CIBA_GRANT_TYPE)) {
+            event.event(EventType.AUTHREQID_TO_TOKEN);
+            action = Action.CIBA;
         } else {
             throw new CorsErrorResponseException(cors, OAuthErrorException.UNSUPPORTED_GRANT_TYPE,
                 "Unsupported " + OIDCLoginProtocol.GRANT_TYPE_PARAM, Response.Status.BAD_REQUEST);
         }
 
         event.detail(Details.GRANT_TYPE, grantType);
+    }
+
+    private void checkParameterDuplicated() {
+        for (String key : formParams.keySet()) {
+            if (formParams.get(key).size() != 1) {
+                throw new CorsErrorResponseException(cors, OAuthErrorException.INVALID_REQUEST, "duplicated parameter",
+                    Response.Status.BAD_REQUEST);
+            }
+        }
     }
 
     public Response codeToToken() {
@@ -433,11 +456,18 @@ public class TokenEndpoint {
         // Set nonce as an attribute in the ClientSessionContext. Will be used for the token generation
         clientSessionCtx.setAttribute(OIDCLoginProtocol.NONCE_PARAM, codeData.getNonce());
 
+        return createTokenResponse(user, userSession, clientSessionCtx, scopeParam, true);
+    }
+
+    public Response createTokenResponse(UserModel user, UserSessionModel userSession, ClientSessionContext clientSessionCtx,
+        String scopeParam, boolean code) {
         AccessToken token = tokenManager.createClientAccessToken(session, realm, client, user, userSession, clientSessionCtx);
 
-        TokenManager.AccessTokenResponseBuilder responseBuilder = tokenManager.responseBuilder(realm, client, event, session, userSession, clientSessionCtx)
-                .accessToken(token)
-                .generateRefreshToken();
+        TokenManager.AccessTokenResponseBuilder responseBuilder = tokenManager
+            .responseBuilder(realm, client, event, session, userSession, clientSessionCtx).accessToken(token);
+        if (OIDCAdvancedConfigWrapper.fromClientModel(client).isUseRefreshToken()) {
+            responseBuilder.generateRefreshToken();
+        }
 
         // KEYCLOAK-6771 Certificate Bound Token
         // https://tools.ietf.org/html/draft-ietf-oauth-mtls-08#section-3
@@ -445,28 +475,35 @@ public class TokenEndpoint {
             AccessToken.CertConf certConf = MtlsHoKTokenUtil.bindTokenWithClientCertificate(request, session);
             if (certConf != null) {
                 responseBuilder.getAccessToken().setCertConf(certConf);
-                responseBuilder.getRefreshToken().setCertConf(certConf);
+                if (OIDCAdvancedConfigWrapper.fromClientModel(client).isUseRefreshToken()) {
+                    responseBuilder.getRefreshToken().setCertConf(certConf);
+                }
             } else {
                 event.error(Errors.INVALID_REQUEST);
-                throw new CorsErrorResponseException(cors, OAuthErrorException.INVALID_REQUEST, "Client Certification missing for MTLS HoK Token Binding", Response.Status.BAD_REQUEST);
+                throw new CorsErrorResponseException(cors, OAuthErrorException.INVALID_REQUEST,
+                    "Client Certification missing for MTLS HoK Token Binding", Response.Status.BAD_REQUEST);
             }
         }
 
         if (TokenUtil.isOIDCRequest(scopeParam)) {
             responseBuilder.generateIDToken().generateAccessTokenHash();
         }
-        
+
         AccessTokenResponse res = null;
-        try {
-            res = responseBuilder.build();
-        } catch (RuntimeException re) {
-            if ("can not get encryption KEK".equals(re.getMessage())) {
-                throw new CorsErrorResponseException(cors, OAuthErrorException.INVALID_REQUEST, "can not get encryption KEK", Response.Status.BAD_REQUEST);
-            } else {
-                throw re;
+        if (code) {
+            try {
+                res = responseBuilder.build();
+            } catch (RuntimeException re) {
+                if ("can not get encryption KEK".equals(re.getMessage())) {
+                    throw new CorsErrorResponseException(cors, OAuthErrorException.INVALID_REQUEST,
+                        "can not get encryption KEK", Response.Status.BAD_REQUEST);
+                } else {
+                    throw re;
+                }
             }
+        } else {
+            res = responseBuilder.build();
         }
-        
         event.success();
 
         return cors.builder(Response.ok(res).type(MediaType.APPLICATION_JSON_TYPE)).build();
@@ -510,7 +547,7 @@ public class TokenEndpoint {
             // plain or S256
             if (codeChallengeMethod != null && codeChallengeMethod.equals(OAuth2Constants.PKCE_METHOD_S256)) {
                 logger.debugf("PKCE codeChallengeMethod = %s", codeChallengeMethod);
-                codeVerifierEncoded = generateS256CodeChallenge(codeVerifier);
+                codeVerifierEncoded = PkceUtils.generateS256CodeChallenge(codeVerifier);
             } else {
                 logger.debug("PKCE codeChallengeMethod is plain");
                 codeVerifierEncoded = codeVerifier;
@@ -539,7 +576,7 @@ public class TokenEndpoint {
             session.clientPolicy().triggerOnEvent(new TokenRefreshContext(formParams));
         } catch (ClientPolicyException cpe) {
             event.error(cpe.getError());
-            throw new CorsErrorResponseException(cors, OAuthErrorException.INVALID_GRANT, cpe.getErrorDetail(), Response.Status.BAD_REQUEST);
+            throw new CorsErrorResponseException(cors, cpe.getError(), cpe.getErrorDetail(), cpe.getErrorStatus());
         }
 
         AccessTokenResponse res;
@@ -658,9 +695,11 @@ public class TokenEndpoint {
         UserSessionModel userSession = processor.getUserSession();
         updateUserSessionFromClientAuth(userSession);
 
-        TokenManager.AccessTokenResponseBuilder responseBuilder = tokenManager.responseBuilder(realm, client, event, session, userSession, clientSessionCtx)
-                .generateAccessToken()
-                .generateRefreshToken();
+        TokenManager.AccessTokenResponseBuilder responseBuilder = tokenManager
+            .responseBuilder(realm, client, event, session, userSession, clientSessionCtx).generateAccessToken();
+        if (OIDCAdvancedConfigWrapper.fromClientModel(client).isUseRefreshToken()) {
+            responseBuilder.generateRefreshToken();
+        }
 
         String scopeParam = clientSessionCtx.getClientSession().getNote(OAuth2Constants.SCOPE);
         if (TokenUtil.isOIDCRequest(scopeParam)) {
@@ -834,9 +873,9 @@ public class TokenEndpoint {
         String requestedSubject = formParams.getFirst(OAuth2Constants.REQUESTED_SUBJECT);
         if (requestedSubject != null) {
             event.detail(Details.REQUESTED_SUBJECT, requestedSubject);
-            UserModel requestedUser = session.users().getUserByUsername(requestedSubject, realm);
+            UserModel requestedUser = session.users().getUserByUsername(realm, requestedSubject);
             if (requestedUser == null) {
-                requestedUser = session.users().getUserById(requestedSubject, realm);
+                requestedUser = session.users().getUserById(realm, requestedSubject);
             }
 
             if (requestedUser == null) {
@@ -999,7 +1038,8 @@ public class TokenEndpoint {
             responseBuilder.getAccessToken().addAudience(audience);
         }
 
-        if (requestedTokenType.equals(OAuth2Constants.REFRESH_TOKEN_TYPE)) {
+        if (requestedTokenType.equals(OAuth2Constants.REFRESH_TOKEN_TYPE)
+            && OIDCAdvancedConfigWrapper.fromClientModel(client).isUseRefreshToken()) {
             responseBuilder.generateRefreshToken();
             responseBuilder.getRefreshToken().issuedFor(client.getClientId());
         }
@@ -1135,7 +1175,7 @@ public class TokenEndpoint {
         FederatedIdentityModel federatedIdentityModel = new FederatedIdentityModel(providerId, context.getId(),
                 context.getUsername(), context.getToken());
 
-        UserModel user = this.session.users().getUserByFederatedIdentity(federatedIdentityModel, realm);
+        UserModel user = this.session.users().getUserByFederatedIdentity(realm, federatedIdentityModel);
 
         if (user == null) {
 
@@ -1154,14 +1194,14 @@ public class TokenEndpoint {
             username = username.trim();
             context.setModelUsername(username);
             if (context.getEmail() != null && !realm.isDuplicateEmailsAllowed()) {
-                UserModel existingUser = session.users().getUserByEmail(context.getEmail(), realm);
+                UserModel existingUser = session.users().getUserByEmail(realm, context.getEmail());
                 if (existingUser != null) {
                     event.error(Errors.FEDERATED_IDENTITY_EXISTS);
                     throw new CorsErrorResponseException(cors, Errors.INVALID_TOKEN, "User already exists", Response.Status.BAD_REQUEST);
                 }
             }
 
-            UserModel existingUser = session.users().getUserByUsername(username, realm);
+            UserModel existingUser = session.users().getUserByUsername(realm, username);
             if (existingUser != null) {
                 event.error(Errors.FEDERATED_IDENTITY_EXISTS);
                 throw new CorsErrorResponseException(cors, Errors.INVALID_TOKEN, "User already exists", Response.Status.BAD_REQUEST);
@@ -1195,11 +1235,11 @@ public class TokenEndpoint {
                 event.error(Errors.USER_DISABLED);
                 throw new CorsErrorResponseException(cors, Errors.INVALID_TOKEN, "Invalid Token", Response.Status.BAD_REQUEST);
             }
-            if (realm.isBruteForceProtected()) {
-                if (session.getProvider(BruteForceProtector.class).isTemporarilyDisabled(session, realm, user)) {
-                    event.error(Errors.USER_TEMPORARILY_DISABLED);
-                    throw new CorsErrorResponseException(cors, Errors.INVALID_TOKEN, "Invalid Token", Response.Status.BAD_REQUEST);
-                }
+
+            String bruteForceError = getDisabledByBruteForceEventError(session.getProvider(BruteForceProtector.class), session, realm, user);
+            if (bruteForceError != null) {
+                event.error(bruteForceError);
+                throw new CorsErrorResponseException(cors, Errors.INVALID_TOKEN, "Invalid Token", Response.Status.BAD_REQUEST);
             }
 
             context.getIdp().updateBrokeredUser(session, realm, user, context);
@@ -1234,8 +1274,10 @@ public class TokenEndpoint {
                     AccessToken invalidToken = new JWSInput(accessTokenString).readJsonContent(AccessToken.class);
                     ClientModel client = realm.getClientByClientId(invalidToken.getIssuedFor());
                     cors.allowedOrigins(session, client);
+                    event.client(client);
                 } catch (JWSInputException ignore) {
                 }
+                event.error(Errors.INVALID_TOKEN);
                 throw new CorsErrorResponseException(cors, OAuthErrorException.INVALID_GRANT, "Invalid bearer token", Status.UNAUTHORIZED);
             }
 
@@ -1244,6 +1286,7 @@ public class TokenEndpoint {
             session.getContext().setClient(client);
 
             cors.allowedOrigins(session, client);
+            event.client(client);
         }
 
         String claimToken = null;
@@ -1290,6 +1333,7 @@ public class TokenEndpoint {
         if (rpt != null) {
             AccessToken accessToken = session.tokens().decode(rpt, AccessToken.class);
             if (accessToken == null) {
+                event.error(Errors.INVALID_REQUEST);
                 throw new CorsErrorResponseException(cors, "invalid_rpt", "RPT signature is invalid", Status.FORBIDDEN);
             }
 
@@ -1297,8 +1341,11 @@ public class TokenEndpoint {
         }
 
         authorizationRequest.setScope(formParams.getFirst("scope"));
-        authorizationRequest.setAudience(formParams.getFirst("audience"));
+        String audienceParam = formParams.getFirst("audience");
+        authorizationRequest.setAudience(audienceParam);
         authorizationRequest.setSubjectToken(accessTokenString);
+
+        event.detail(Details.AUDIENCE, audienceParam);
 
         String submitRequest = formParams.getFirst("submit_request");
 
@@ -1308,6 +1355,7 @@ public class TokenEndpoint {
         List<String> permissions = formParams.get("permission");
 
         if (permissions != null) {
+            event.detail(Details.PERMISSION, String.join("|", permissions));
             for (String permission : permissions) {
                 String[] parts = permission.split("#");
                 String resource = parts[0];
@@ -1339,7 +1387,21 @@ public class TokenEndpoint {
 
         authorizationRequest.setMetadata(metadata);
 
-        return AuthorizationTokenService.instance().authorize(authorizationRequest);
+        Response authorizationResponse = AuthorizationTokenService.instance().authorize(authorizationRequest);
+
+        event.success();
+
+        return authorizationResponse;
+    }
+
+    public Response oauth2DeviceCodeToToken() {
+        DeviceGrantType deviceGrantType = new DeviceGrantType(formParams, client, session, this, realm, event, cors);
+        return deviceGrantType.oauth2DeviceFlow();
+    }
+
+    public Response cibaGrant() {
+        CibaGrantType grantType = new CibaGrantType(formParams, client, session, this, realm, event, cors);
+        return grantType.cibaGrant();
     }
 
     // https://tools.ietf.org/html/rfc7636#section-4.1
@@ -1356,16 +1418,8 @@ public class TokenEndpoint {
         return m.matches();
     }
 
-    // https://tools.ietf.org/html/rfc7636#section-4.6
-    private String generateS256CodeChallenge(String codeVerifier) throws Exception {
-        MessageDigest md = MessageDigest.getInstance("SHA-256");
-        md.update(codeVerifier.getBytes("ISO_8859_1"));
-        byte[] digestBytes = md.digest();
-        String codeVerifierEncoded = Base64Url.encode(digestBytes);
-        return codeVerifierEncoded;
-    }
-
     private static class TokenExchangeSamlProtocol extends SamlProtocol {
+
         final SamlClient samlClient;
 
         TokenExchangeSamlProtocol(SamlClient samlClient) {
