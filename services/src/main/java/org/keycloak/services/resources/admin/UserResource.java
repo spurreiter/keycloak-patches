@@ -65,6 +65,7 @@ import org.keycloak.services.ForbiddenException;
 import org.keycloak.services.ServicesLogger;
 import org.keycloak.services.managers.AuthenticationManager;
 import org.keycloak.services.managers.BruteForceProtector;
+import org.keycloak.services.managers.UserConsentManager;
 import org.keycloak.services.managers.UserSessionManager;
 import org.keycloak.services.resources.LoginActionsService;
 import org.keycloak.services.resources.account.AccountFormService;
@@ -98,10 +99,8 @@ import javax.ws.rs.core.Response.Status;
 import javax.ws.rs.core.UriBuilder;
 import java.net.URI;
 import java.text.MessageFormat;
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
@@ -162,11 +161,13 @@ public class UserResource {
         auth.users().requireManage(user);
         try {
 
+            boolean wasPermanentlyLockedOut = false;
             if (rep.isEnabled() != null && rep.isEnabled()) {
-                UserLoginFailureModel failureModel = session.sessions().getUserLoginFailure(realm, user.getId());
+                UserLoginFailureModel failureModel = session.loginFailures().getUserLoginFailure(realm, user.getId());
                 if (failureModel != null) {
                     failureModel.clearFailures();
                 }
+                wasPermanentlyLockedOut = session.getProvider(BruteForceProtector.class).isPermanentlyLockedOut(session, realm, user);
             }
 
             Response response = validateUserProfile(user, rep, session);
@@ -175,6 +176,12 @@ public class UserResource {
             }
             updateUserFromRep(user, rep, session, true);
             RepresentationToModel.createCredentials(rep, session, realm, user, true);
+
+            // we need to do it here as the attributes would be overwritten by what is in the rep
+            if (wasPermanentlyLockedOut) {
+                session.getProvider(BruteForceProtector.class).cleanUpPermanentLockout(session, realm, user);
+            }
+
             adminEvent.operation(OperationType.UPDATE).resourcePath(session.getContext().getUri()).representation(rep).success();
 
             if (session.getTransactionManager().isActive()) {
@@ -224,17 +231,17 @@ public class UserResource {
         List<String> reqActions = rep.getRequiredActions();
 
         if (reqActions != null) {
-            Set<String> allActions = new HashSet<>();
-            for (ProviderFactory factory : session.getKeycloakSessionFactory().getProviderFactories(RequiredActionProvider.class)) {
-                allActions.add(factory.getId());
-            }
-            for (String action : allActions) {
-                if (reqActions.contains(action)) {
-                    user.addRequiredAction(action);
-                } else if (removeMissingRequiredActions) {
-                    user.removeRequiredAction(action);
-                }
-            }
+            session.getKeycloakSessionFactory()
+                    .getProviderFactoriesStream(RequiredActionProvider.class)
+                    .map(ProviderFactory::getId)
+                    .distinct()
+                    .forEach(action -> {
+                        if (reqActions.contains(action)) {
+                            user.addRequiredAction(action);
+                        } else if (removeMissingRequiredActions) {
+                            user.removeRequiredAction(action);
+                        }
+                    });
         }
 
         List<CredentialRepresentation> credentials = rep.getCredentials();
@@ -373,7 +380,7 @@ public class UserResource {
 
     private Stream<FederatedIdentityRepresentation> getFederatedIdentities(UserModel user) {
         Set<String> idps = realm.getIdentityProvidersStream().map(IdentityProviderModel::getAlias).collect(Collectors.toSet());
-        return session.users().getFederatedIdentitiesStream(user, realm)
+        return session.users().getFederatedIdentitiesStream(realm, user)
                 .filter(identity -> idps.contains(identity.getIdentityProvider()))
                 .map(ModelToRepresentation::toRepresentation);
     }
@@ -390,7 +397,7 @@ public class UserResource {
     @NoCache
     public Response addFederatedIdentity(final @PathParam("provider") String provider, FederatedIdentityRepresentation rep) {
         auth.users().requireManage(user);
-        if (session.users().getFederatedIdentity(user, provider, realm) != null) {
+        if (session.users().getFederatedIdentity(realm, user, provider) != null) {
             return ErrorResponse.exists("User is already linked with provider");
         }
 
@@ -478,15 +485,9 @@ public class UserResource {
         if (client == null) {
             throw new NotFoundException("Client not found");
         }
-        boolean revokedConsent = session.users().revokeConsentForClient(realm, user.getId(), client.getId());
-        boolean revokedOfflineToken = new UserSessionManager(session).revokeOfflineToken(user, client);
+        boolean revokedConsent = UserConsentManager.revokeConsentToClient(session, client, user);
 
-        if (revokedConsent) {
-            // Logout clientSessions for this user and client
-            AuthenticationManager.backchannelLogoutUserFromClient(session, realm, user, client, session.getContext().getUri(), headers);
-        }
-
-        if (!revokedConsent && !revokedOfflineToken) {
+        if (!revokedConsent) {
             throw new NotFoundException("Consent nor offline token not found");
         }
         adminEvent.operation(OperationType.ACTION).resourcePath(session.getContext().getUri()).success();
@@ -780,7 +781,7 @@ public class UserResource {
             lifespan = realm.getActionTokenGeneratedByAdminLifespan();
         }
         int expiration = Time.currentTime() + lifespan;
-        ExecuteActionsActionToken token = new ExecuteActionsActionToken(user.getId(), expiration, actions, redirectUri, clientId);
+        ExecuteActionsActionToken token = new ExecuteActionsActionToken(user.getId(), user.getEmail(), expiration, actions, redirectUri, clientId);
 
         try {
             UriBuilder builder = LoginActionsService.actionTokenProcessor(session.getContext().getUri());

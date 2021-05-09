@@ -19,7 +19,6 @@
 package org.keycloak.authentication.authenticators.x509;
 
 import org.apache.http.HttpResponse;
-import org.apache.http.client.HttpClient;
 import org.apache.http.client.methods.HttpGet;
 
 import org.keycloak.common.util.Time;
@@ -47,7 +46,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
 import java.net.URISyntaxException;
-import java.net.URLConnection;
 import java.security.GeneralSecurityException;
 import java.security.cert.CRLException;
 import java.security.cert.CertPathValidatorException;
@@ -65,6 +63,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
+import org.apache.http.client.methods.CloseableHttpResponse;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.util.EntityUtils;
 
 /**
  * @author <a href="mailto:pnalyvayko@agi.com">Peter Nalyvayko</a>
@@ -297,17 +298,18 @@ public class CertificateValidator {
             try {
                 logger.debugf("Loading CRL from %s", remoteURI.toString());
 
-                HttpClient httpClient = session.getProvider(HttpClientProvider.class).getHttpClient();
+                CloseableHttpClient httpClient = session.getProvider(HttpClientProvider.class).getHttpClient();
                 HttpGet get = new HttpGet(remoteURI);
                 get.setHeader("Pragma", "no-cache");
                 get.setHeader("Cache-Control", "no-cache, no-store");
-                HttpResponse response = httpClient.execute(get);
-                InputStream content = response.getEntity().getContent();
-                try {
-                    X509CRL crl = loadFromStream(cf, content);
-                    return Collections.singleton(crl);
-                } finally {
-                    content.close();
+                try (CloseableHttpResponse response = httpClient.execute(get)) {
+                    try {
+                        InputStream content = response.getEntity().getContent();
+                        X509CRL crl = loadFromStream(cf, content);
+                        return Collections.singleton(crl);
+                    } finally {
+                        EntityUtils.consumeQuietly(response.getEntity());
+                    }
                 }
             }
             catch(IOException ex) {
@@ -385,6 +387,7 @@ public class CertificateValidator {
     CRLLoaderImpl _crlLoader;
     boolean _ocspEnabled;
     OCSPChecker ocspChecker;
+    boolean _timestampValidationEnabled;
 
     public CertificateValidator() {
 
@@ -396,7 +399,8 @@ public class CertificateValidator {
                                    CRLLoaderImpl crlLoader,
                                    boolean oCSPCheckingEnabled,
                                    OCSPChecker ocspChecker,
-                                   KeycloakSession session) {
+                                   KeycloakSession session,
+                                   boolean timestampValidationEnabled) {
         _certChain = certChain;
         _keyUsageBits = keyUsageBits;
         _extendedKeyUsage = extendedKeyUsage;
@@ -406,6 +410,7 @@ public class CertificateValidator {
         _ocspEnabled = oCSPCheckingEnabled;
         this.ocspChecker = ocspChecker;
         this.session = session;
+        _timestampValidationEnabled = timestampValidationEnabled;
 
         if (ocspChecker == null)
             throw new IllegalArgumentException("ocspChecker");
@@ -487,10 +492,10 @@ public class CertificateValidator {
         return this;
     }
 
-    public CertificateValidator validateTimestamps(boolean isValidationEnabled) throws GeneralSecurityException {
-        if (!isValidationEnabled) {
+    public CertificateValidator validateTimestamps() throws GeneralSecurityException {
+        if (!_timestampValidationEnabled)
             return this;
-        }
+
         for (int i = 0; i < _certChain.length; i++)
         {
             X509Certificate x509Certificate = _certChain[i];
@@ -510,6 +515,7 @@ public class CertificateValidator {
                 throw new GeneralSecurityException(message);
             }
         }
+
         return this;
     }
 
@@ -520,6 +526,10 @@ public class CertificateValidator {
         }
         Map<X500Principal, X509Certificate> rootCerts = truststoreProvider.getRootCertificates();
         X509Certificate ca = rootCerts.get(issuer);
+        if (ca == null) {
+            // fallback to lookup the issuer from the list of intermediary CAs
+            ca = truststoreProvider.getIntermediateCertificates().get(issuer);
+        }
         if (ca != null) {
             ca.checkValidity();
         }
@@ -639,6 +649,7 @@ public class CertificateValidator {
         boolean _ocspEnabled;
         String _responderUri;
         X509Certificate _responderCert;
+        boolean _timestampValidationEnabled;
 
         public CertificateValidatorBuilder() {
             _extendedKeyUsage = new LinkedList<>();
@@ -807,6 +818,19 @@ public class CertificateValidator {
             }
         }
 
+        public class TimestampValidationBuilder {
+
+            CertificateValidatorBuilder _parent;
+            protected TimestampValidationBuilder(CertificateValidatorBuilder parent) {
+                _parent = parent;
+            }
+
+            public CertificateValidatorBuilder enabled(boolean timestampValidationEnabled) {
+                _timestampValidationEnabled = timestampValidationEnabled;
+                return _parent;
+            }
+        }
+
         public CertificateValidatorBuilder session(KeycloakSession session) {
             this.session = session;
             return this;
@@ -824,13 +848,17 @@ public class CertificateValidator {
             return new RevocationStatusCheckBuilder(this);
         }
 
+        public TimestampValidationBuilder timestampValidation() {
+            return new TimestampValidationBuilder(this);
+        }
+
         public CertificateValidator build(X509Certificate[] certs) {
             if (_crlLoader == null) {
                  _crlLoader = new CRLFileLoader(session, "");
             }
             return new CertificateValidator(certs, _keyUsageBits, _extendedKeyUsage,
                     _crlCheckingEnabled, _crldpEnabled, _crlLoader, _ocspEnabled,
-                    new BouncyCastleOCSPChecker(session, _responderUri, _responderCert), session);
+                    new BouncyCastleOCSPChecker(session, _responderUri, _responderCert), session, _timestampValidationEnabled);
         }
     }
 

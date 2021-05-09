@@ -62,7 +62,7 @@ dockerrun(){
   keycloak-ldap:$VERSION
 }
 
-case $1 in 
+case $1 in
 --run)
   dockerrun
   ;;
@@ -73,6 +73,7 @@ case $1 in
   cat $0
   ;;
 *)
-  mvnbuild
+mvnbuild
   ;;
 esac
+

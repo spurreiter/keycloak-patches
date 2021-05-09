@@ -48,7 +48,7 @@ import org.keycloak.protocol.oidc.utils.AuthorizeClientUtil;
 import org.keycloak.representations.AccessToken;
 import org.keycloak.services.CorsErrorResponseException;
 import org.keycloak.services.clientpolicy.ClientPolicyException;
-import org.keycloak.services.clientpolicy.TokenRevokeContext;
+import org.keycloak.services.clientpolicy.context.TokenRevokeContext;
 import org.keycloak.services.managers.UserSessionCrossDCManager;
 import org.keycloak.services.managers.UserSessionManager;
 import org.keycloak.services.resources.Cors;
@@ -98,11 +98,13 @@ public class TokenRevocationEndpoint {
 
         formParams = request.getDecodedFormParameters();
 
+        checkParameterDuplicated(formParams);
+
         try {
             session.clientPolicy().triggerOnEvent(new TokenRevokeContext(formParams));
         } catch (ClientPolicyException cpe) {
             event.error(cpe.getError());
-            throw new CorsErrorResponseException(cors, OAuthErrorException.INVALID_GRANT, cpe.getErrorDetail(), Response.Status.BAD_REQUEST);
+            throw new CorsErrorResponseException(cors, cpe.getError(), cpe.getErrorDetail(), cpe.getErrorStatus());
         }
 
         checkToken();
@@ -139,7 +141,7 @@ public class TokenRevocationEndpoint {
     }
 
     private void checkClient() {
-        AuthorizeClientUtil.ClientAuthResult clientAuth = AuthorizeClientUtil.authorizeClient(session, event);
+        AuthorizeClientUtil.ClientAuthResult clientAuth = AuthorizeClientUtil.authorizeClient(session, event, cors);
         client = clientAuth.getClient();
 
         event.client(client);
@@ -218,6 +220,14 @@ public class TokenRevocationEndpoint {
         event.user(user);
     }
 
+    private void checkParameterDuplicated(MultivaluedMap<String, String> formParams) {
+        for (String key : formParams.keySet()) {
+            if (formParams.get(key).size() != 1) {
+                throw new CorsErrorResponseException(cors, Errors.INVALID_REQUEST, "duplicated parameter", Response.Status.BAD_REQUEST);
+            }
+        }
+    }
+
     private void revokeClient() {
         session.users().revokeConsentForClient(realm, user.getId(), client.getId());
         if (TokenUtil.TOKEN_TYPE_OFFLINE.equals(token.getType())) {
@@ -227,7 +237,17 @@ public class TokenRevocationEndpoint {
                 .map(userSession -> userSession.getAuthenticatedClientSessionByClient(client.getId()))
                 .filter(Objects::nonNull)
                 .collect(Collectors.toList()) // collect to avoid concurrent modification as dettachClientSession removes the user sessions.
-                .forEach(clientSession -> TokenManager.dettachClientSession(session.sessions(), realm, clientSession));
+                .forEach(clientSession -> {
+                    UserSessionModel userSession = clientSession.getUserSession();
+                    TokenManager.dettachClientSession(clientSession);
+
+                    if (userSession != null) {
+                        // TODO: Might need optimization to prevent loading client sessions from cache in getAuthenticatedClientSessions()
+                        if (userSession.getAuthenticatedClientSessions().isEmpty()) {
+                            session.sessions().removeUserSession(realm, userSession);
+                        }
+                    }
+                });
     }
 
     private void revokeAccessToken() {
