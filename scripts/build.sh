@@ -51,6 +51,28 @@ EOS
     .
 }
 
-mvnbuild
-# copy
-# dockerbuild
+dockerrun(){
+  docker run --rm -it \
+  --name kc \
+  -p 8080:8080 \
+  -e KEYCLOAK_USER=admin \
+  -e KEYCLOAK_PASSWORD=admin \
+  -e KEYCLOAK_LOGLEVEL=DEBUG \
+  -v ${cwd}/../deployments:/opt/jboss/keycloak/standalone/deployments \
+  keycloak-ldap:$VERSION
+}
+
+case $1 in
+--run)
+  dockerrun
+  ;;
+--docker)
+  dockerbuild
+  ;;
+-h|--help)
+  cat $0
+  ;;
+*)
+  mvnbuild
+  ;;
+esac
