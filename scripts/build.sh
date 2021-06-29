@@ -73,7 +73,7 @@ case $1 in
   cat $0
   ;;
 *)
-mvnbuild
+  mvnbuild
   ;;
 esac
 
