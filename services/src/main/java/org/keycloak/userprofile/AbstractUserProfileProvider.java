@@ -17,7 +17,7 @@
  *
  */
 
-package org.keycloak.userprofile.legacy;
+package org.keycloak.userprofile;
 
 import static org.keycloak.userprofile.DefaultAttributes.READ_ONLY_ATTRIBUTE_KEY;
 import static org.keycloak.userprofile.UserProfileContext.ACCOUNT;
@@ -44,17 +44,6 @@ import org.keycloak.models.KeycloakSessionFactory;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserModel;
 import org.keycloak.services.messages.Messages;
-import org.keycloak.userprofile.AttributeContext;
-import org.keycloak.userprofile.AttributeMetadata;
-import org.keycloak.userprofile.AttributeValidatorMetadata;
-import org.keycloak.userprofile.Attributes;
-import org.keycloak.userprofile.DefaultAttributes;
-import org.keycloak.userprofile.DefaultUserProfile;
-import org.keycloak.userprofile.UserProfile;
-import org.keycloak.userprofile.UserProfileContext;
-import org.keycloak.userprofile.UserProfileMetadata;
-import org.keycloak.userprofile.UserProfileProvider;
-import org.keycloak.userprofile.UserProfileProviderFactory;
 import org.keycloak.userprofile.validator.BlankAttributeValidator;
 import org.keycloak.userprofile.validator.BrokeringFederatedUsernameHasValueValidator;
 import org.keycloak.userprofile.validator.DuplicateEmailValidator;
@@ -80,7 +69,36 @@ public abstract class AbstractUserProfileProvider<U extends UserProfileProvider>
         KeycloakSession session = c.getSession();
         KeycloakContext context = session.getContext();
         RealmModel realm = context.getRealm();
-        return realm.isEditUsernameAllowed();
+
+        switch (c.getContext()) {
+            case REGISTRATION_PROFILE:
+            case IDP_REVIEW:
+                return !realm.isRegistrationEmailAsUsername();
+            case ACCOUNT_OLD:
+            case ACCOUNT:
+            case UPDATE_PROFILE:
+                return realm.isEditUsernameAllowed();
+            case USER_API:
+                return true;
+            default:
+                return false;
+        }
+    }
+    
+    private static boolean readUsernameCondition(AttributeContext c) {
+        KeycloakSession session = c.getSession();
+        KeycloakContext context = session.getContext();
+        RealmModel realm = context.getRealm();
+
+        switch (c.getContext()) {
+            case REGISTRATION_PROFILE:
+            case IDP_REVIEW:
+                return !realm.isRegistrationEmailAsUsername();
+            case UPDATE_PROFILE:
+                return realm.isEditUsernameAllowed();
+            default:
+                return true;
+        }
     }
 
     public static Pattern getRegexPatternString(String[] builtinReadOnlyAttributes) {
@@ -211,7 +229,7 @@ public abstract class AbstractUserProfileProvider<U extends UserProfileProvider>
      * Sub-types can override this method to customize how contextual profile metadata is configured at runtime.
      *
      * @param metadata the profile metadata
-     * @param metadata the current session
+     * @param session the current session
      * @return the metadata
      */
     protected UserProfileMetadata configureUserProfile(UserProfileMetadata metadata, KeycloakSession session) {
@@ -248,7 +266,7 @@ public abstract class AbstractUserProfileProvider<U extends UserProfileProvider>
     private UserProfile createUserProfile(UserProfileContext context, Map<String, ?> attributes, UserModel user) {
         UserProfileMetadata metadata = configureUserProfile(contextualMetadataRegistry.get(context), session);
         Attributes profileAttributes = createAttributes(context, attributes, user, metadata);
-        return new DefaultUserProfile(profileAttributes, createUserFactory(), user, session);
+        return new DefaultUserProfile(metadata, profileAttributes, createUserFactory(), user, session);
     }
 
     protected Attributes createAttributes(UserProfileContext context, Map<String, ?> attributes, UserModel user,
@@ -265,11 +283,11 @@ public abstract class AbstractUserProfileProvider<U extends UserProfileProvider>
     private UserProfileMetadata createRegistrationUserCreationProfile() {
         UserProfileMetadata metadata = new UserProfileMetadata(REGISTRATION_USER_CREATION);
 
-        metadata.addAttribute(UserModel.USERNAME, new AttributeValidatorMetadata(RegistrationEmailAsUsernameUsernameValueValidator.ID), new AttributeValidatorMetadata(RegistrationUsernameExistsValidator.ID));
+        metadata.addAttribute(UserModel.USERNAME, -2, new AttributeValidatorMetadata(RegistrationEmailAsUsernameUsernameValueValidator.ID), new AttributeValidatorMetadata(RegistrationUsernameExistsValidator.ID));
 
-        metadata.addAttribute(UserModel.EMAIL, new AttributeValidatorMetadata(RegistrationEmailAsUsernameEmailValueValidator.ID));
+        metadata.addAttribute(UserModel.EMAIL, -1, new AttributeValidatorMetadata(RegistrationEmailAsUsernameEmailValueValidator.ID));
 
-        metadata.addAttribute(READ_ONLY_ATTRIBUTE_KEY, createReadOnlyAttributeUnchangedValidator(readOnlyAttributesPattern));
+        metadata.addAttribute(READ_ONLY_ATTRIBUTE_KEY, 1000, createReadOnlyAttributeUnchangedValidator(readOnlyAttributesPattern));
 
         return metadata;
     }
@@ -277,21 +295,18 @@ public abstract class AbstractUserProfileProvider<U extends UserProfileProvider>
     private UserProfileMetadata createDefaultProfile(UserProfileContext context, AttributeValidatorMetadata readOnlyValidator) {
         UserProfileMetadata metadata = new UserProfileMetadata(context);
 
-        metadata.addAttribute(UserModel.USERNAME, AbstractUserProfileProvider::editUsernameCondition,
+        metadata.addAttribute(UserModel.USERNAME, -2, 
                 AbstractUserProfileProvider::editUsernameCondition,
+                AbstractUserProfileProvider::readUsernameCondition,
                 new AttributeValidatorMetadata(UsernameHasValueValidator.ID),
                 new AttributeValidatorMetadata(DuplicateUsernameValidator.ID),
-                new AttributeValidatorMetadata(UsernameMutationValidator.ID));
+                new AttributeValidatorMetadata(UsernameMutationValidator.ID)).setAttributeDisplayName("${username}");
 
-        metadata.addAttribute(UserModel.FIRST_NAME, new AttributeValidatorMetadata(BlankAttributeValidator.ID,
-                BlankAttributeValidator.createConfig(Messages.MISSING_FIRST_NAME)));
-
-        metadata.addAttribute(UserModel.LAST_NAME, new AttributeValidatorMetadata(BlankAttributeValidator.ID, BlankAttributeValidator.createConfig(Messages.MISSING_LAST_NAME)));
-
-        metadata.addAttribute(UserModel.EMAIL, new AttributeValidatorMetadata(BlankAttributeValidator.ID, BlankAttributeValidator.createConfig(Messages.MISSING_EMAIL)),
-        		new AttributeValidatorMetadata(EmailValidator.ID, ValidatorConfig.builder().config(EmailValidator.IGNORE_EMPTY_VALUE, true).build()),
+        metadata.addAttribute(UserModel.EMAIL, -1, 
+                new AttributeValidatorMetadata(BlankAttributeValidator.ID, BlankAttributeValidator.createConfig(Messages.MISSING_EMAIL, false)),
         		new AttributeValidatorMetadata(DuplicateEmailValidator.ID),
-        		new AttributeValidatorMetadata(EmailExistsAsUsernameValidator.ID));
+        		new AttributeValidatorMetadata(EmailExistsAsUsernameValidator.ID))
+            .setAttributeDisplayName("${email}");
 
         List<AttributeValidatorMetadata> readonlyValidators = new ArrayList<>();
 
@@ -301,7 +316,7 @@ public abstract class AbstractUserProfileProvider<U extends UserProfileProvider>
             readonlyValidators.add(readOnlyValidator);
         }
 
-        metadata.addAttribute(READ_ONLY_ATTRIBUTE_KEY, readonlyValidators);
+        metadata.addAttribute(READ_ONLY_ATTRIBUTE_KEY, 1000, readonlyValidators);
 
         return metadata;
     }
@@ -309,14 +324,12 @@ public abstract class AbstractUserProfileProvider<U extends UserProfileProvider>
     private UserProfileMetadata createBrokeringProfile(AttributeValidatorMetadata readOnlyValidator) {
         UserProfileMetadata metadata = new UserProfileMetadata(IDP_REVIEW);
 
-        metadata.addAttribute(UserModel.USERNAME, new AttributeValidatorMetadata(BrokeringFederatedUsernameHasValueValidator.ID));
+        metadata.addAttribute(UserModel.USERNAME, -2, AbstractUserProfileProvider::editUsernameCondition,
+                AbstractUserProfileProvider::readUsernameCondition, new AttributeValidatorMetadata(BrokeringFederatedUsernameHasValueValidator.ID)).setAttributeDisplayName("${username}");
 
-        metadata.addAttribute(UserModel.FIRST_NAME,	new AttributeValidatorMetadata(BlankAttributeValidator.ID, BlankAttributeValidator.createConfig(Messages.MISSING_FIRST_NAME)));
-
-        metadata.addAttribute(UserModel.LAST_NAME, new AttributeValidatorMetadata(BlankAttributeValidator.ID, BlankAttributeValidator.createConfig(Messages.MISSING_LAST_NAME)));
-
-        metadata.addAttribute(UserModel.EMAIL, new AttributeValidatorMetadata(BlankAttributeValidator.ID, BlankAttributeValidator.createConfig(Messages.MISSING_EMAIL)),
-        		new AttributeValidatorMetadata(EmailValidator.ID));
+        metadata.addAttribute(UserModel.EMAIL, -1, 
+                new AttributeValidatorMetadata(BlankAttributeValidator.ID, BlankAttributeValidator.createConfig(Messages.MISSING_EMAIL, true)))
+            .setAttributeDisplayName("${email}");
 
         List<AttributeValidatorMetadata> readonlyValidators = new ArrayList<>();
 
@@ -326,7 +339,7 @@ public abstract class AbstractUserProfileProvider<U extends UserProfileProvider>
             readonlyValidators.add(readOnlyValidator);
         }
 
-        metadata.addAttribute(READ_ONLY_ATTRIBUTE_KEY, readonlyValidators);
+        metadata.addAttribute(READ_ONLY_ATTRIBUTE_KEY, 1000, readonlyValidators);
 
         return metadata;
     }
@@ -342,7 +355,7 @@ public abstract class AbstractUserProfileProvider<U extends UserProfileProvider>
 
         readonlyValidators.add(createReadOnlyAttributeUnchangedValidator(adminReadOnlyAttributesPattern));
 
-        metadata.addAttribute(READ_ONLY_ATTRIBUTE_KEY, readonlyValidators);
+        metadata.addAttribute(READ_ONLY_ATTRIBUTE_KEY, 1000, readonlyValidators);
 
         return metadata;
     }
