@@ -10,11 +10,12 @@ echo $VERSION
 
 cd "$cwd/.."
 
-gitmain(){
+checkgitbranch(){
+  local expBranch="release"
   local branch=$(git rev-parse --abbrev-ref HEAD)
 
-  if [ $branch != "main" ]; then
-    echo "not on main branch"
+  if [ $branch != $expBranch ]; then
+    echo "not on $expBranch branch"
     exit 1
   fi
   # git reset --hard origin/main
@@ -29,6 +30,6 @@ update(){
   tar -xzf "$VERSION.tar.gz"
 }
 
-#gitmain
+checkgitbranch
 download
 update
